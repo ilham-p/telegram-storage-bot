@@ -66,24 +66,23 @@ telegram_app.add_handler(MessageHandler(
     auto_capture_channel_post
 ))
 
-# Inisialisasi event loop untuk Telegram bot di background
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-loop.run_until_complete(telegram_app.initialize())
-
 @app.route("/", methods=["GET"])
 def index():
     return "Bot Telegram & Google Sheets Berjalan!", 200
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    """Endpoint webhook untuk menerima data dari Telegram tanpa konflik loop."""
+    """Endpoint webhook untuk menerima data dari Telegram."""
     if request.method == "POST":
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
         
-        # Proses update secara asinkron yang aman untuk Flask & Gunicorn
-        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        # Jalankan proses update menggunakan asyncio event loop baru per request
+        async def process():
+            await telegram_app.initialize()
+            await telegram_app.process_update(update)
+            
+        asyncio.run(process())
         
     return "OK", 200
 
