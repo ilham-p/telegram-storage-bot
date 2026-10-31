@@ -11,7 +11,7 @@ app = Flask(__name__)
 
 # Konfigurasi Token dan Channel ID dari Environment Variables
 TOKEN = os.environ.get("BOT_TOKEN", "9037444926:AAGAzo0KDswH4DJuQWgZSab4Rn4Gga0UNfM")
-CHANNEL_ID = int(os.environ.get("-1003971007907", "-100xxxxxxxxxx"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003971007907"))
 
 # --- KONFIGURASI GOOGLE SHEETS ---
 # Render membaca credentials JSON dari Environment Variable (agar aman)
