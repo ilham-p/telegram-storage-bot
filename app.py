@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from datetime import datetime
 from flask import Flask, request
 from telegram import Update
@@ -10,11 +11,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 app = Flask(__name__)
 
 # Konfigurasi Token dan Channel ID dari Environment Variables
-TOKEN = os.environ.get("BOT_TOKEN", "9037444926:AAGAzo0KDswH4DJuQWgZSab4Rn4Gga0UNfM")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003971007907"))
+TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
 # --- KONFIGURASI GOOGLE SHEETS ---
-# Render membaca credentials JSON dari Environment Variable (agar aman)
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 def get_google_sheet():
@@ -22,15 +22,12 @@ def get_google_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
     if GOOGLE_CREDENTIALS_JSON:
-        # Jika kredensial disimpan di Environment Variable Render
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     else:
-        # Jika dijalankan lokal menggunakan file credentials.json
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
         
     client = gspread.authorize(creds)
-    # Ganti "Database Video Bot" dengan nama Google Spreadsheet Anda
     sheet = client.open("Database Video Bot").sheet1 
     return sheet
 
@@ -52,18 +49,16 @@ async def auto_capture_channel_post(update: Update, context: ContextTypes.DEFAUL
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            # Masukkan data otomatis ke Google Sheets
             sheet = get_google_sheet()
-            # Kolom: Message ID, File ID, Caption, Tanggal
             sheet.append_row([
                 str(message_id),
                 file_id,
                 caption,
                 timestamp
             ])
-            print(f"✅ Sukses mencatat video ke Google Sheets! Message ID: {message_id}")
+            print(f"Sukses mencatat video ke Google Sheets! Message ID: {message_id}")
         except Exception as e:
-            print(f"❌ Gagal mencatat ke Google Sheets: {e}")
+            print(f"Gagal mencatat ke Google Sheets: {e}")
 
 # Daftarkan handler pemantau channel
 telegram_app.add_handler(MessageHandler(
@@ -71,21 +66,27 @@ telegram_app.add_handler(MessageHandler(
     auto_capture_channel_post
 ))
 
+# Inisialisasi event loop untuk Telegram bot di background
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.run_until_complete(telegram_app.initialize())
+
 @app.route("/", methods=["GET"])
 def index():
     return "Bot Telegram & Google Sheets Berjalan!", 200
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    """Endpoint webhook untuk menerima data dari Telegram."""
+    """Endpoint webhook untuk menerima data dari Telegram tanpa konflik loop."""
     if request.method == "POST":
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
         
-        import asyncio
-        asyncio.run(telegram_app.process_update(update))
+        # Proses update secara asinkron yang aman untuk Flask & Gunicorn
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
         
     return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
