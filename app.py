@@ -47,11 +47,14 @@ _sheet = None
 def get_google_sheet():
     global _sheet
     if _sheet is None:
+        log.info("Menghubungkan ke Google Sheets...")
         if GOOGLE_CREDENTIALS_JSON:
             client = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
         else:
             client = gspread.service_account(filename="credentials.json")
+        client.set_timeout(30)  # jangan menggantung selamanya jika Google lambat
         _sheet = client.open(SHEET_NAME).sheet1
+        log.info("Terhubung ke spreadsheet '%s'", SHEET_NAME)
     return _sheet
 
 
@@ -102,12 +105,27 @@ async def auto_capture_channel_post(update: Update, context: ContextTypes.DEFAUL
     if not media:
         return
     caption = post.caption or "Tanpa Keterangan"
+    log.info("Video diterima dari channel. Message ID: %s", post.message_id)
     try:
-        added = await asyncio.to_thread(record_video, post.message_id, media.file_id, caption)
-        if added:
-            log.info("Video dicatat. Message ID: %s", post.message_id)
+        added = await asyncio.wait_for(
+            asyncio.to_thread(record_video, post.message_id, media.file_id, caption),
+            timeout=90,
+        )
+        log.info("Video %s. Message ID: %s", "dicatat" if added else "sudah ada (dilewati)", post.message_id)
+    except asyncio.TimeoutError:
+        log.error("Timeout saat menulis ke Google Sheets (Message ID: %s)", post.message_id)
     except Exception:
         log.exception("Gagal mencatat ke Google Sheets")
+
+
+async def log_unmatched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bantu diagnosis: catat channel post yang TIDAK cocok dengan filter."""
+    post = update.channel_post
+    if post:
+        log.warning(
+            "Channel post diabaikan. chat.id=%s (CHANNEL_ID di Render=%s), punya video=%s, punya dokumen=%s",
+            post.chat.id, CHANNEL_ID, bool(post.video), bool(post.document),
+        )
 
 
 telegram_app.add_handler(
@@ -116,7 +134,12 @@ telegram_app.add_handler(
         & filters.Chat(chat_id=CHANNEL_ID)
         & (filters.VIDEO | filters.Document.VIDEO),
         auto_capture_channel_post,
-    )
+    ),
+    group=0,
+)
+# group 1 jalan terpisah: hanya mencatat log untuk channel post yang tidak ditangani
+telegram_app.add_handler(
+    MessageHandler(filters.UpdateType.CHANNEL_POST, log_unmatched), group=1
 )
 
 # Satu event loop permanen di thread terpisah (menghindari asyncio.run per request
@@ -198,13 +221,22 @@ def webhook():
         abort(400)
     try:
         update = Update.de_json(data, telegram_app.bot)
-        run_async(telegram_app.process_update(update), timeout=60)
+        # Proses di latar belakang agar Telegram langsung dapat jawaban 200
+        # (tidak menunggu Google Sheets) dan tidak mengirim ulang update.
+        fut = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), _loop)
+
+        def _done(f):
+            exc = f.exception()
+            if exc:
+                log.error("Gagal memproses update", exc_info=exc)
+
+        fut.add_done_callback(_done)
     except Exception:
-        log.exception("Gagal memproses update")
+        log.exception("Gagal menerima update")
     return "OK", 200
 
 
-@app.route("/sync", methods=["POST"])
+@app.route("/sync", methods=["GET", "POST"])  # GET juga diterima karena cron sering default ke GET; tetap wajib secret
 def sync():
     """Dipanggil cron (mis. cron-job.org) dengan header X-Sync-Secret."""
     if not SYNC_SECRET or not ADMIN_CHAT_ID:
