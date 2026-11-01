@@ -1,135 +1,220 @@
 import os
 import json
+import hmac
 import asyncio
+import logging
+import threading
 from datetime import datetime
-from flask import Flask, request
+
+from flask import Flask, request, abort
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram.error import BadRequest, RetryAfter
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
 
 app = Flask(__name__)
 
-# Konfigurasi Token dan Channel ID dari Environment Variables
+# ---------------------------------------------------------------------------
+# Konfigurasi (Environment Variables)
+# ---------------------------------------------------------------------------
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
-
-# --- KONFIGURASI GOOGLE SHEETS ---
+# Secret acak untuk memverifikasi bahwa request webhook benar-benar dari Telegram
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+# Secret untuk endpoint /sync (dipanggil oleh cron)
+SYNC_SECRET = os.environ.get("SYNC_SECRET")
+# ID chat pribadi Anda dengan bot (kirim /start ke bot dulu). Dipakai untuk
+# memeriksa apakah sebuah pesan channel masih ada.
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Database Video Bot")
+
+if not TOKEN or not CHANNEL_ID:
+    raise RuntimeError("BOT_TOKEN dan CHANNEL_ID wajib diisi.")
+if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
+    raise RuntimeError("WEBHOOK_SECRET wajib diisi (min. 16 karakter, hanya A-Z a-z 0-9 _ -).")
+
+# ---------------------------------------------------------------------------
+# Google Sheets (client di-cache, semua panggilan blocking dijalankan di thread)
+# ---------------------------------------------------------------------------
+_sheet_lock = threading.Lock()
+_sheet = None
+
 
 def get_google_sheet():
-    """Fungsi untuk menghubungkan bot ke Google Sheets."""
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
-    if GOOGLE_CREDENTIALS_JSON:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        
-    client = gspread.authorize(creds)
-    sheet = client.open("Database Video Bot").sheet1 
-    return sheet
+    global _sheet
+    if _sheet is None:
+        if GOOGLE_CREDENTIALS_JSON:
+            client = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
+        else:
+            client = gspread.service_account(filename="credentials.json")
+        _sheet = client.open(SHEET_NAME).sheet1
+    return _sheet
 
-# Inisialisasi aplikasi Telegram bot
-telegram_app = ApplicationBuilder().token(TOKEN).build()
+
+def sanitize_cell(value: str) -> str:
+    """Cegah formula injection (=, +, -, @) pada isi sel dari caption."""
+    value = str(value)
+    if value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def record_video(message_id: int, file_id: str, caption: str) -> bool:
+    """Catat video ke sheet. Return True jika baris baru ditambahkan."""
+    with _sheet_lock:
+        sheet = get_google_sheet()
+        existing = sheet.col_values(1)  # kolom A = message_id, cocokkan persis
+        if str(message_id) in existing:
+            return False
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row(
+            [str(message_id), file_id, sanitize_cell(caption[:1000]), timestamp],
+            value_input_option="RAW",
+        )
+        return True
+
+
+def delete_rows_by_message_ids(message_ids: set) -> int:
+    with _sheet_lock:
+        sheet = get_google_sheet()
+        col = sheet.col_values(1)
+        rows = [i + 1 for i, v in enumerate(col) if v in message_ids]
+        for r in sorted(rows, reverse=True):  # hapus dari bawah agar indeks tidak bergeser
+            sheet.delete_rows(r)
+        return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+telegram_app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+
 
 async def auto_capture_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fungsi otomatis saat ada video di-upload ke channel, lalu dicatat ke Sheets."""
     post = update.channel_post
     if not post or post.chat.id != CHANNEL_ID:
         return
-
-    video = post.video or post.document
-    caption = post.caption or "Tanpa Keterangan"
-    message_id = post.message_id
-    
-    if video:
-        file_id = video.file_id
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        try:
-            sheet = get_google_sheet()
-            # Cek apakah message_id sudah ada untuk menghindari duplikat
-            cells = sheet.findall(str(message_id))
-            if not cells:
-                sheet.append_row([
-                    str(message_id),
-                    file_id,
-                    caption,
-                    timestamp
-                ])
-                print(f"Sukses mencatat video ke Google Sheets! Message ID: {message_id}")
-        except Exception as e:
-            print(f"Gagal mencatat ke Google Sheets: {e}")
-
-async def sync_spreadsheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Perintah /sync untuk memeriksa dan membersihkan data jika video dihapus di channel."""
-    message = update.message
-    if not message:
+    media = post.video or post.document
+    if not media:
         return
-
-    await message.reply_text("🔄 Sedang memeriksa dan menyinkronkan data spreadsheet dengan channel...")
-
+    caption = post.caption or "Tanpa Keterangan"
     try:
-        sheet = get_google_sheet()
-        # Ambil semua data di kolom pertama (Message ID) mulai baris ke-2
-        message_ids = sheet.col_values(1)[1:] 
-        
-        removed_count = 0
-        # Telusuri dari baris paling bawah ke atas agar indeks baris tidak bergeser saat dihapus
-        for index in range(len(message_ids), 0, -1):
-            msg_id_str = message_ids[index - 1]
+        added = await asyncio.to_thread(record_video, post.message_id, media.file_id, caption)
+        if added:
+            log.info("Video dicatat. Message ID: %s", post.message_id)
+    except Exception:
+        log.exception("Gagal mencatat ke Google Sheets")
+
+
+telegram_app.add_handler(
+    MessageHandler(
+        filters.UpdateType.CHANNEL_POST
+        & filters.Chat(chat_id=CHANNEL_ID)
+        & (filters.VIDEO | filters.Document.VIDEO),
+        auto_capture_channel_post,
+    )
+)
+
+# Satu event loop permanen di thread terpisah (menghindari asyncio.run per request
+# yang membuat loop baru dan merusak koneksi httpx milik bot).
+_loop = asyncio.new_event_loop()
+
+
+def _run_loop():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+
+
+threading.Thread(target=_run_loop, daemon=True).start()
+
+
+def run_async(coro, timeout=300):
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout)
+
+
+run_async(telegram_app.initialize())
+
+
+async def message_exists(message_id: int) -> bool:
+    """
+    Telegram TIDAK mengirim update saat pesan channel dihapus, jadi keberadaan
+    pesan dicek dengan menyalin pesan ke chat admin lalu langsung menghapus salinannya.
+    """
+    bot = telegram_app.bot
+    while True:
+        try:
+            copied = await bot.copy_message(
+                chat_id=ADMIN_CHAT_ID, from_chat_id=CHANNEL_ID, message_id=message_id,
+                disable_notification=True,
+            )
             try:
-                msg_id = int(msg_id_str)
-                # Cek apakah pesan masih ada di channel menggunakan Telegram API
-                # forwardMessage atau getChat memberikan indikasi apakah pesan masih eksis
-                try:
-                    # Mencoba meneruskan pesan ke chat bot/admin untuk verifikasi eksistensi
-                    await context.bot.forward_message(
-                        chat_id=message.chat_id,
-                        from_chat_id=CHANNEL_ID,
-                        message_id=msg_id
-                    )
-                    # Jika berhasil diteruskan (dan langsung dihapus lagi agar tidak mengganggu), berarti pesan masih ada
-                    # (Atau kita biarkan jika ingin sekalian mengecek)
-                except Exception:
-                    # Jika Telegram mengembalikan error (pesan tidak ditemukan / sudah dihapus), hapus baris di Sheets
-                    sheet.delete_rows(index + 1) # +1 karena index spreadsheet mulai dari 1 dan ada header
-                    removed_count += 1
-            except ValueError:
-                continue
+                await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=copied.message_id)
+            except Exception:
+                pass
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "not found" in msg or "message_id_invalid" in msg:
+                return False
+            raise  # error lain: jangan anggap terhapus
 
-        await message.reply_text(f"✅ Sinkronisasi selesai! {removed_count} data baris yang videonya sudah dihapus berhasil dibersihkan dari spreadsheet.")
-    except Exception as e:
-        await message.reply_text(f"❌ Terjadi kesalahan saat sinkronisasi: {e}")
 
-# Daftarkan handler
-telegram_app.add_handler(MessageHandler(
-    filters.Chat(chat_id=CHANNEL_ID) & (filters.VIDEO | filters.Document.VIDEO),
-    auto_capture_channel_post
-))
-telegram_app.add_handler(CommandHandler("sync", sync_spreadsheet_command))
+async def sync_deleted():
+    sheet_ids = await asyncio.to_thread(lambda: get_google_sheet().col_values(1))
+    ids = [int(v) for v in sheet_ids if v.isdigit()]
+    gone = set()
+    for mid in ids:
+        try:
+            if not await message_exists(mid):
+                gone.add(str(mid))
+        except Exception:
+            log.exception("Gagal memeriksa pesan %s, dilewati", mid)
+        await asyncio.sleep(0.2)  # hormati rate limit Telegram
+    removed = await asyncio.to_thread(delete_rows_by_message_ids, gone) if gone else 0
+    return len(ids), removed
 
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Bot Telegram & Google Sheets Berjalan (Dengan Fitur Sync)", 200
-
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    """Endpoint webhook untuk menerima data dari Telegram."""
-    if request.method == "POST":
-        json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, telegram_app.bot)
-        
-        async def process():
-            await telegram_app.initialize()
-            await telegram_app.process_update(update)
-            
-        asyncio.run(process())
-        
     return "OK", 200
 
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(header, WEBHOOK_SECRET):
+        abort(403)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400)
+    try:
+        update = Update.de_json(data, telegram_app.bot)
+        run_async(telegram_app.process_update(update), timeout=60)
+    except Exception:
+        log.exception("Gagal memproses update")
+    return "OK", 200
+
+
+@app.route("/sync", methods=["POST"])
+def sync():
+    """Dipanggil cron (mis. cron-job.org) dengan header X-Sync-Secret."""
+    if not SYNC_SECRET or not ADMIN_CHAT_ID:
+        abort(503)
+    if not hmac.compare_digest(request.headers.get("X-Sync-Secret", ""), SYNC_SECRET):
+        abort(403)
+    checked, removed = run_async(sync_deleted(), timeout=3000)
+    return {"checked": checked, "removed": removed}, 200
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Produksi: gunicorn -w 1 --threads 4 -t 3000 app:app
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
