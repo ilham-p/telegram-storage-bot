@@ -220,6 +220,13 @@ def webhook():
     if not isinstance(data, dict):
         abort(400)
     try:
+        # Log ringkas jenis update (untuk diagnosis): jenis, tipe chat, id chat
+        kind = next((k for k in data if k != "update_id"), "?")
+        chat = (data.get(kind) or {}).get("chat") or {}
+        log.info(
+            "Update masuk: jenis=%s, tipe_chat=%s, chat.id=%s (CHANNEL_ID=%s)",
+            kind, chat.get("type"), chat.get("id"), CHANNEL_ID,
+        )
         update = Update.de_json(data, telegram_app.bot)
         # Proses di latar belakang agar Telegram langsung dapat jawaban 200
         # (tidak menunggu Google Sheets) dan tidak mengirim ulang update.
@@ -229,11 +236,16 @@ def webhook():
             exc = f.exception()
             if exc:
                 log.error("Gagal memproses update", exc_info=exc)
+            else:
+                log.info("Selesai memproses update %s", data.get("update_id"))
 
         fut.add_done_callback(_done)
     except Exception:
         log.exception("Gagal menerima update")
     return "OK", 200
+
+
+_sync_running = threading.Lock()
 
 
 @app.route("/sync", methods=["GET", "POST"])  # GET juga diterima karena cron sering default ke GET; tetap wajib secret
@@ -243,8 +255,22 @@ def sync():
         abort(503)
     if not hmac.compare_digest(request.headers.get("X-Sync-Secret", ""), SYNC_SECRET):
         abort(403)
-    checked, removed = run_async(sync_deleted(), timeout=3000)
-    return {"checked": checked, "removed": removed}, 200
+    # Jalankan di latar belakang: cron-job.org hanya menunggu 30 detik.
+    if not _sync_running.acquire(blocking=False):
+        return {"status": "sudah berjalan"}, 202
+
+    async def _job():
+        try:
+            log.info("Sinkron hapus dimulai")
+            checked, removed = await sync_deleted()
+            log.info("Sinkron selesai: diperiksa=%s, dihapus=%s", checked, removed)
+        except Exception:
+            log.exception("Sinkron gagal")
+        finally:
+            _sync_running.release()
+
+    asyncio.run_coroutine_threadsafe(_job(), _loop)
+    return {"status": "dimulai, hasil ada di Logs"}, 202
 
 
 if __name__ == "__main__":
