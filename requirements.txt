@@ -1,6 +1,10 @@
-flask
-python-telegram-bot
-gspread
+flask>=3.0
+python-telegram-bot>=21.0
+gspread>=6.0
 oauth2client
 requests
-gunicorn
+gunicorn>=22.0
+
+
+
+
