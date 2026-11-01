@@ -1,0 +1,4 @@
+telethon>=1.36
+starlette>=0.37
+uvicorn>=0.30
+# Opsional (mempercepat dekripsi, pasang setelah semuanya jalan): cryptg
